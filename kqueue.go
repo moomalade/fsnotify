@@ -15,6 +15,10 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	//"log"
+
+	// hack:
+	//"strings"
 )
 
 // Watcher watches a set of files, delivering events to a channel.
@@ -120,6 +124,7 @@ func (w *Watcher) Remove(name string) error {
 	// Find all watched paths that are in this directory that are not external.
 	if isDir {
 		var pathsToRemove []string
+
 		w.mu.Lock()
 		for _, path := range w.paths {
 			wdir, _ := filepath.Split(path.name)
@@ -127,9 +132,35 @@ func (w *Watcher) Remove(name string) error {
 				if !w.externalWatches[path.name] {
 					pathsToRemove = append(pathsToRemove, path.name)
 				}
+
+				// TimJ:
+				//   1. mkdir w
+				//   2. touch w/1 w/2 w/3 w/4
+				//   3. mv w a
+				//   4. mkdir w
+				//   5. mv a/* w
+				//
+				// At line 3, we'll notice the 'w' is removed and call Remove().
+				// But fileExists will still contain all the files in w.
+				//
+				// This causes line 5 to send rename events for a/1 a/2 a/3 a/4
+				// But no create events for w/1 w/2 w/3 w/4, because we think they're duplicates.
+				//
+				// Additionally, at line 3, we don't send Remove|Rename events for the
+				// watched files within the directory.
+				// If we're sending a create, we should match it with a remove|rename.
+				// It would be nice to do that here, but we don't know if Remove() has been
+				// called because of that, or for some other reason.
+				// readEvents() needs to tell us.
+
+				_, created := w.fileExists[path.name];
+				if created {
+					delete(w.fileExists,path.name)
+				}
 			}
 		}
 		w.mu.Unlock()
+
 		for _, name := range pathsToRemove {
 			// Since these are internal, not much sense in propagating error
 			// to the user, as that will just confuse them with an error about
@@ -268,8 +299,19 @@ func (w *Watcher) readEvents() {
 			watchfd := int(kevent.Ident)
 			mask := uint32(kevent.Fflags)
 			w.mu.Lock()
-			path := w.paths[watchfd]
+
+			path, exists := w.paths[watchfd]
 			w.mu.Unlock()
+
+			// TimJ:
+			// If we get a chunk of events and one of them removes the path for a subsequent event
+			// we'll fail a lookup. kqueue will remove any subsequent events as needed so we only
+			// need to worry about the events we've already pulled.
+			if !exists {
+				kevents = kevents[1:]
+				continue
+			}
+
 			event := newEvent(path.name, mask)
 
 			if path.isDir && !(event.Op&Remove == Remove) {
@@ -384,6 +426,8 @@ func (w *Watcher) sendDirectoryChangeEvents(dirPath string) {
 		w.mu.Lock()
 		_, doesExist := w.fileExists[filePath]
 		w.mu.Unlock()
+		//log.Println("+",filePath,doesExist)
+
 		if !doesExist {
 			// Send create event
 			w.Events <- newCreateEvent(filePath)
